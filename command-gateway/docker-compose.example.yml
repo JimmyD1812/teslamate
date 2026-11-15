@@ -1,0 +1,58 @@
+# Command gateway + Tesla vehicle-command proxy.
+#
+# Add these services to the docker-compose.yml that runs your TeslaMate
+# stack, then:
+#
+#   docker compose up -d tesla-http-proxy tesla-climate-gateway
+#
+# IMPORTANT NOTES
+# - The gateway port is bound to 127.0.0.1 on the host ONLY, same as the
+#   read-only MCP server. Reach it from outside via Tailscale only.
+# - The proxy service below follows Tesla's official vehicle-command
+#   project (github.com/teslamotors/vehicle-command). Its image/build and
+#   exact flags evolve — CONFIRM against the official docs at install time
+#   before first use. The proxy needs:
+#     * the developer app's PRIVATE key (the public half is hosted on your
+#       domain and paired with the car),
+#     * a TLS certificate for its listener (a self-signed one is fine on
+#       this private container network),
+#     * the fleet key / token configuration described in its docs.
+#   Keep the private key in a file on the host, mounted read-only, never in
+#   git and never in the gateway container.
+# - ./command-gateway-data (tokens.json + audit.log) is created on the host
+#   at install time and must never be committed to git (see .gitignore).
+
+services:
+  tesla-climate-gateway:
+    build: ./command-gateway
+    restart: unless-stopped
+    environment:
+      - GATEWAY_ENABLED=${GATEWAY_ENABLED:-false}
+      - GATEWAY_AUTH_TOKEN=${GATEWAY_AUTH_TOKEN:?set in .env}
+      - GATEWAY_PORT=8766
+      - TESLA_VIN=${TESLA_VIN:?set in .env}
+      - TESLA_CLIENT_ID=${TESLA_CLIENT_ID:?set in .env}
+      - TESLA_CLIENT_SECRET=${TESLA_CLIENT_SECRET:?set in .env}
+      - TESLA_TOKEN_FILE=/data/tokens.json
+      - GATEWAY_AUDIT_LOG=/data/audit.log
+      - TESLA_PROXY_BASE_URL=https://tesla-http-proxy:4443
+      - WAKE_BEFORE_CLIMATE=${WAKE_BEFORE_CLIMATE:-true}
+    volumes:
+      - ./command-gateway-data:/data
+    ports:
+      - "127.0.0.1:8766:8766"
+    depends_on:
+      - tesla-http-proxy
+
+  # Skeleton only — wire per Tesla's official vehicle-command docs.
+  tesla-http-proxy:
+    # image or build for the official tesla-http-proxy goes here,
+    # confirmed at install time.
+    restart: unless-stopped
+    # volumes:
+    #   - ./tesla-keys:/keys:ro   # private key + TLS cert live here, host-only
+    # command: >
+    #   tesla-http-proxy -tls-key /keys/tls.key -cert /keys/tls.crt
+    #   -key-file /keys/private-key.pem -port 4443
+    expose:
+      - "4443"

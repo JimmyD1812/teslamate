@@ -1,0 +1,7 @@
+# Secrets and runtime state must never be committed.
+.env
+tokens.json
+audit.log
+data/
+.venv/
+__pycache__/
