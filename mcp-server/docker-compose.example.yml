@@ -1,0 +1,30 @@
+# Add this service to the docker-compose.yml that runs your TeslaMate stack
+# (alongside the teslamate, database and grafana services), then:
+#
+#   docker compose up -d teslamate-mcp
+#
+# Notes:
+# - The port is bound to 127.0.0.1 on the host ONLY. Reach it from outside
+#   the host through Tailscale (e.g. `tailscale serve`), never by changing
+#   the binding to 0.0.0.0 and port-forwarding it on a router.
+# - Secrets come from the .env file next to this compose file (see
+#   .env.example). The .env file must never be committed to git.
+# - "database" below is the service name of TeslaMate's PostgreSQL container
+#   in the standard TeslaMate compose file; adjust if yours differs.
+
+services:
+  teslamate-mcp:
+    build: ./mcp-server
+    restart: unless-stopped
+    environment:
+      - TESLAMATE_DB_HOST=database
+      - TESLAMATE_DB_PORT=5432
+      - TESLAMATE_DB_NAME=${TESLAMATE_DB_NAME:-teslamate}
+      - TESLAMATE_DB_USER=teslamate_mcp
+      - TESLAMATE_DB_PASSWORD=${TESLAMATE_MCP_DB_PASSWORD:?set in .env}
+      - MCP_PORT=8765
+      - MCP_AUTH_TOKEN=${MCP_AUTH_TOKEN:?set in .env}
+    ports:
+      - "127.0.0.1:8765:8765"
+    depends_on:
+      - database

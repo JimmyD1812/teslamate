@@ -1,0 +1,4 @@
+# Secrets and local state must never be committed.
+.env
+.venv/
+__pycache__/
