@@ -50,6 +50,48 @@ Additionally:
 | `vampire_drain` | Battery lost while parked, per asleep/offline stretch, as %/day |
 | `monthly_summary` | A month at a glance: distance, drives, kWh charged (AC/DC split), cost |
 | `top_places` | Most frequent destinations and charging locations |
+| `charging_cost_report` | Recorded charging costs plus time-of-use estimates for unpriced sessions; Supercharger/DC breakout |
+| `charge_curve_analysis` | One DC session's curve in numbers: peak kW, kW at 50%/80%, 10–80% time, vs the car's own median |
+| `commute_insights` | Recurring routes: frequency, typical departure, median duration/efficiency, fastest departure hour |
+| `anomaly_scan` | Findings vs the car's own norms: inefficient drives, drain spikes, charging losses, range drops |
+| `battery_care_score` | Charging-habit score out of 100 with evidence: DC share, full charges, deep discharges, time parked >90% |
+| `update_impact` | Efficiency before vs after each software update TeslaMate logged |
+
+## Parity with MyTeslaMate (the paid hosted service)
+
+MyTeslaMate sells hosted TeslaMate (about €4.99/month per vehicle) plus
+extras. How this self-hosted setup stacks up, honestly:
+
+| MyTeslaMate feature | Here |
+| --- | --- |
+| Hosted, no server to run | Your own always-on box (a Raspberry Pi is enough). The one thing money genuinely buys is skipping this. |
+| Automatic backups | `scripts/backup.sh` — nightly `pg_dump` with rotation, run from cron. Your backups live on your disk, not their cloud. |
+| Grafana dashboards | Same upstream TeslaMate dashboards, included. |
+| AI chat assistant | This MCP server + your assistant. Deliberately **query-only**: MyTeslaMate's assistant can also *command* the car; this server is read-only by design and cannot. |
+| TeslaMateAgile (time-of-use pricing) | Emulated: `charging_cost_report` prices unpriced sessions from a `TESLAMATE_TOU_RATES` schedule in the server config. |
+| Supercharger costs imported automatically | Partially emulated: DC sessions are broken out with recorded costs where TeslaMate has them, and unpriced sessions are flagged rather than hidden. (Their price feed is theirs; there is no public equivalent to import.) |
+| TeslaMateAPI + MQTT access | Upstream TeslaMate already publishes a live MQTT feed; this MCP covers the query/API side. |
+| Free Fleet API proxy + raw token | Not emulated — that makes them a Tesla API provider with usage billing. If direct Fleet API access is ever needed, it is a separate project. |
+| Sentry Guard break-in alerts | Not emulatable on the logging path: it relies on Fleet API telemetry events, which a read-only Owner API logger never sees. |
+
+## What the paid services do not have
+
+These tools exist because an assistant reading the whole logbook can compute
+things a dashboard only displays:
+
+- **`anomaly_scan`** — cross-referencing drives, drain, charging losses and
+  range trend against the car's own baselines, and naming the likely causes.
+- **`commute_insights`** — route-level patterns (including which departure
+  hour is actually fastest) instead of one trip at a time.
+- **`charge_curve_analysis`** — DC taper behavior as comparable numbers
+  across sessions, so "this charger was slow" becomes provable.
+- **`battery_care_score`** — habit coaching with the evidence attached, not
+  just a degradation graph.
+- **`update_impact`** — settles "the update ruined my efficiency" with the
+  car's own before/after numbers.
+- **Pattern questions in plain language** — any cross-cut of the above,
+  asked conversationally, e.g. "are my winter tires costing me range on the
+  work run?"
 
 TeslaMate stores distances in km and temperatures in °C; results include
 miles / °F conversions. Energy and efficiency figures are estimates derived

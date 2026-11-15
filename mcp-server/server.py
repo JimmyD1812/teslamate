@@ -22,9 +22,11 @@ TeslaMate stores distances in km and temperatures in degC. Tool results
 include miles / degF conversions alongside the raw values.
 """
 
+import json
 import os
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
 import psycopg
 from psycopg.rows import dict_row
@@ -544,6 +546,484 @@ def top_places(limit: int = 10, car_id: int | None = None) -> dict:
             for r in charges_at
         ],
     }
+
+
+def _median(values):
+    vals = sorted(v for v in values if v is not None)
+    if not vals:
+        return None
+    n = len(vals)
+    return vals[n // 2] if n % 2 else (vals[n // 2 - 1] + vals[n // 2]) / 2.0
+
+
+def _tou_rates():
+    """Time-of-use price bands from the TESLAMATE_TOU_RATES env var.
+
+    JSON list like [{"from_hour": 0, "to_hour": 6, "price_per_kwh": 0.11},
+    {"from_hour": 6, "to_hour": 24, "price_per_kwh": 0.24}]. Hours are local
+    time in TESLAMATE_TIMEZONE (default UTC). Returns None when unconfigured.
+    """
+    raw = os.environ.get("TESLAMATE_TOU_RATES", "")
+    if not raw:
+        return None
+    try:
+        bands = json.loads(raw)
+        tz = ZoneInfo(os.environ.get("TESLAMATE_TIMEZONE", "UTC"))
+        return bands, tz
+    except Exception:
+        return None
+
+
+def _tou_cost_for_process(process_id, bands, tz):
+    """Estimate a session's cost by pricing the energy added in each hour
+    band, using the per-sample charge_energy_added deltas (TeslaMateAgile
+    style). Returns (cost, priced_kwh) or (None, 0)."""
+    samples = q(
+        "SELECT date, charge_energy_added FROM charges"
+        " WHERE charging_process_id = %s ORDER BY date",
+        (process_id,),
+    )
+    total = 0.0
+    priced = 0.0
+    prev = 0.0
+    for s in samples:
+        if s["charge_energy_added"] is None:
+            continue
+        added = float(s["charge_energy_added"])
+        delta = max(added - prev, 0.0)
+        prev = added
+        if delta == 0:
+            continue
+        hour = s["date"].astimezone(tz).hour
+        price = None
+        for b in bands:
+            if b["from_hour"] <= hour < b["to_hour"]:
+                price = float(b["price_per_kwh"])
+                break
+        if price is not None:
+            total += delta * price
+            priced += delta
+    return (round(total, 2), round(priced, 2)) if priced else (None, 0.0)
+
+
+@mcp.tool()
+def charging_cost_report(days: int = 90, car_id: int | None = None) -> dict:
+    """Charging costs over the last N days, emulating the paid add-ons:
+    sessions TeslaMate already priced (via its geofence rates) are summed as
+    recorded; sessions with no recorded cost are estimated from a
+    time-of-use rate schedule when one is configured on the server
+    (TESLAMATE_TOU_RATES), the way TeslaMateAgile prices by time band.
+    DC fast (Supercharger) sessions are broken out separately, and any
+    session that could not be priced is flagged instead of silently dropped."""
+    car = resolve_car(car_id)
+    rows = q(
+        """
+        SELECT cp.id, cp.start_date, cp.charge_energy_added, cp.cost,
+               g.name AS geofence, a.display_name AS address,
+               EXISTS (
+                 SELECT 1 FROM charges c
+                 WHERE c.charging_process_id = cp.id AND c.fast_charger_present
+               ) AS dc_fast
+        FROM charging_processes cp
+        LEFT JOIN geofences g ON g.id = cp.geofence_id
+        LEFT JOIN addresses a ON a.id = cp.address_id
+        WHERE cp.car_id = %s AND cp.start_date >= now() - make_interval(days => %s)
+        ORDER BY cp.start_date
+        """,
+        (car["id"], days),
+    )
+    tou = _tou_rates()
+    recorded_total = 0.0
+    estimated_total = 0.0
+    unpriced = []
+    dc = {"sessions": 0, "kwh": 0.0, "recorded_cost": 0.0, "estimated_cost": 0.0}
+    for r in rows:
+        kwh = float(r["charge_energy_added"]) if r["charge_energy_added"] is not None else 0.0
+        cost = None
+        source = None
+        if r["cost"] is not None:
+            cost = float(r["cost"])
+            source = "recorded"
+            recorded_total += cost
+        elif tou:
+            est, priced_kwh = _tou_cost_for_process(r["id"], tou[0], tou[1])
+            if est is not None:
+                cost = est
+                source = "tou_estimate"
+                estimated_total += est
+        if cost is None:
+            unpriced.append(
+                {
+                    "charge_id": r["id"],
+                    "start": r["start_date"].isoformat() if r["start_date"] else None,
+                    "location": place_name(r["geofence"], r["address"]),
+                    "kwh": round(kwh, 1),
+                }
+            )
+        if r["dc_fast"]:
+            dc["sessions"] += 1
+            dc["kwh"] = round(dc["kwh"] + kwh, 1)
+            if source == "recorded":
+                dc["recorded_cost"] = round(dc["recorded_cost"] + cost, 2)
+            elif source == "tou_estimate":
+                dc["estimated_cost"] = round(dc["estimated_cost"] + cost, 2)
+    return {
+        "days": days,
+        "sessions": len(rows),
+        "recorded_cost_total": round(recorded_total, 2),
+        "tou_estimated_cost_total": round(estimated_total, 2),
+        "tou_schedule_configured": tou is not None,
+        "supercharger_dc": dc,
+        "unpriced_sessions": unpriced,
+    }
+
+
+@mcp.tool()
+def charge_curve_analysis(charge_id: int | None = None, car_id: int | None = None) -> dict:
+    """DC fast-charge curve for one session (the given charge_id, or the most
+    recent DC session): peak power, power at about 50% and 80% battery,
+    minutes from 10% to 80%, and how the peak compares with the median peak
+    of past DC sessions. Shows taper behavior numerically instead of just a
+    graph."""
+    car = resolve_car(car_id)
+    if charge_id is None:
+        row = q1(
+            """
+            SELECT cp.id FROM charging_processes cp
+            WHERE cp.car_id = %s AND EXISTS (
+              SELECT 1 FROM charges c
+              WHERE c.charging_process_id = cp.id AND c.fast_charger_present)
+            ORDER BY cp.start_date DESC LIMIT 1
+            """,
+            (car["id"],),
+        )
+        if row is None:
+            raise ValueError("No DC fast-charging sessions logged yet.")
+        charge_id = row["id"]
+    samples = q(
+        "SELECT date, battery_level, charger_power, charge_energy_added"
+        " FROM charges WHERE charging_process_id = %s ORDER BY date",
+        (charge_id,),
+    )
+    if not samples:
+        raise ValueError(f"No charge samples for session {charge_id}.")
+
+    def kw_at(target_level):
+        best = min(samples, key=lambda s: abs((s["battery_level"] or 0) - target_level))
+        return best["charger_power"]
+
+    def time_at(target_level):
+        for s in samples:
+            if (s["battery_level"] or 0) >= target_level:
+                return s["date"]
+        return None
+
+    peak = max((s["charger_power"] or 0) for s in samples)
+    t10, t80 = time_at(10), time_at(80)
+    minutes_10_80 = (
+        round((t80 - t10).total_seconds() / 60.0, 1) if t10 and t80 else None
+    )
+    peaks = q(
+        """
+        SELECT max(c.charger_power) AS peak
+        FROM charges c
+        JOIN charging_processes cp ON cp.id = c.charging_process_id
+        WHERE cp.car_id = %s AND c.fast_charger_present
+        GROUP BY cp.id
+        """,
+        (car["id"],),
+    )
+    median_peak = _median([p["peak"] for p in peaks])
+    return {
+        "charge_id": charge_id,
+        "samples": len(samples),
+        "peak_kw": peak,
+        "kw_at_50pct": kw_at(50),
+        "kw_at_80pct": kw_at(80),
+        "minutes_10_to_80pct": minutes_10_80,
+        "median_peak_kw_all_dc_sessions": median_peak,
+        "peak_vs_median_pct": (
+            round((peak - median_peak) / median_peak * 100.0, 1)
+            if median_peak
+            else None
+        ),
+    }
+
+
+@mcp.tool()
+def commute_insights(min_trips: int = 3, car_id: int | None = None) -> dict:
+    """Recurring-route analysis: groups drives by start and end place
+    (geofence or address), and for every route taken at least min_trips
+    times reports how often, the typical departure hour, median duration and
+    efficiency, and which departure hour band has the fastest median trip.
+    This is the pattern layer a dashboard does not give you."""
+    car = resolve_car(car_id)
+    rows = q(
+        DRIVE_SELECT + "WHERE d.car_id = %s ORDER BY d.start_date",
+        (car["id"],),
+    )
+    groups = {}
+    for r in rows:
+        key = (
+            place_name(r["start_geofence"], r["start_address"]) or "Unknown",
+            place_name(r["end_geofence"], r["end_address"]) or "Unknown",
+        )
+        groups.setdefault(key, []).append(r)
+    out = []
+    for (src, dst), trips in groups.items():
+        if len(trips) < min_trips or src == dst:
+            continue
+        summaries = [drive_row(t, car["efficiency"]) for t in trips]
+        durations = [s["duration_min"] for s in summaries if s["duration_min"]]
+        whmis = [s["est_wh_per_mi"] for s in summaries if s["est_wh_per_mi"]]
+        hours = [t["start_date"].hour for t in trips if t["start_date"]]
+        by_hour = {}
+        for t, s in zip(trips, summaries):
+            if t["start_date"] and s["duration_min"]:
+                by_hour.setdefault(t["start_date"].hour, []).append(s["duration_min"])
+        best_hour, best_med = None, None
+        for h, ds in by_hour.items():
+            if len(ds) >= 2:
+                med = _median(ds)
+                if best_med is None or med < best_med:
+                    best_hour, best_med = h, med
+        out.append(
+            {
+                "from": src,
+                "to": dst,
+                "trips": len(trips),
+                "typical_departure_hour_utc": _median(hours),
+                "median_duration_min": _median(durations),
+                "fastest_departure_hour_utc": best_hour,
+                "fastest_median_duration_min": best_med,
+                "median_wh_per_mi": _median(whmis),
+            }
+        )
+    out.sort(key=lambda x: -x["trips"])
+    return {"routes": out[:10]}
+
+
+@mcp.tool()
+def anomaly_scan(days: int = 30, car_id: int | None = None) -> dict:
+    """Scans the last N days for things that look wrong, comparing each event
+    against the car's own norms: drives far less efficient than usual for
+    that route, parked-drain spikes, charging sessions with abnormal losses,
+    weak DC fast-charge peaks, and sudden projected-range drops. Returns
+    structured findings for the assistant to explain — the point is catching
+    connections (a software update, a cold snap, a failing tire, a new
+    parasitic drain) early."""
+    car = resolve_car(car_id)
+    findings = []
+
+    rows = q(
+        DRIVE_SELECT
+        + "WHERE d.car_id = %s AND d.start_date >= now() - make_interval(days => %s)"
+          " ORDER BY d.start_date",
+        (car["id"], days),
+    )
+    summaries = [drive_row(r, car["efficiency"]) for r in rows]
+    all_whmi = [s["est_wh_per_mi"] for s in summaries if s["est_wh_per_mi"]]
+    overall_med = _median(all_whmi)
+    by_route = {}
+    for s in summaries:
+        by_route.setdefault((s["from"], s["to"]), []).append(s)
+    for s in summaries:
+        route_vals = [x["est_wh_per_mi"] for x in by_route[(s["from"], s["to"])] if x["est_wh_per_mi"]]
+        baseline = _median(route_vals) if len(route_vals) >= 3 else overall_med
+        if baseline and s["est_wh_per_mi"] and s["est_wh_per_mi"] > baseline * 1.4:
+            findings.append(
+                {
+                    "type": "inefficient_drive",
+                    "when": s["start"],
+                    "detail": (
+                        f"Drive {s['from']} -> {s['to']} used {s['est_wh_per_mi']:.0f} Wh/mi"
+                        f" vs a typical {baseline:.0f} Wh/mi for that comparison set"
+                        f" (outside temp {s['outside_temp_avg_f']} F)."
+                    ),
+                }
+            )
+
+    drain = vampire_drain(days=days, min_hours=3.0, car_id=car["id"])
+    rates = [e["pct_per_day"] for e in drain["events"] if e["pct_per_day"] is not None]
+    med_rate = _median(rates)
+    if med_rate:
+        for e in drain["events"]:
+            if e["pct_per_day"] and e["pct_per_day"] > max(med_rate * 3, med_rate + 1.0):
+                findings.append(
+                    {
+                        "type": "parked_drain_spike",
+                        "when": e["from"],
+                        "detail": (
+                            f"Parked for {e['hours_parked']} h and lost {e['battery_lost_pct']}%"
+                            f" ({e['pct_per_day']}%/day vs a typical {med_rate}%/day)."
+                            " Usual suspects: Sentry mode, cabin overheat protection,"
+                            " a door/trunk left ajar, or an app polling the car awake."
+                        ),
+                    }
+                )
+
+    for c in recent_charges(days=days, limit=50, car_id=car["id"]):
+        if c["charging_loss_pct"] is not None and c["charging_loss_pct"] > 15:
+            findings.append(
+                {
+                    "type": "high_charging_loss",
+                    "when": c["start"],
+                    "detail": (
+                        f"{c['type']} session at {c['location']} lost"
+                        f" {c['charging_loss_pct']}% between wall and battery"
+                        f" (typical is roughly 8-12% for AC, less for DC)."
+                    ),
+                }
+            )
+
+    health = battery_health(car_id=car["id"])
+    trend = [t for t in health["weekly_trend"] if t["projected_rated_range_km"]]
+    if len(trend) >= 2:
+        first, last = trend[0], trend[-1]
+        drop = (
+            (last["projected_rated_range_km"] - first["projected_rated_range_km"])
+            / first["projected_rated_range_km"]
+            * 100.0
+        )
+        if drop < -1.5:
+            findings.append(
+                {
+                    "type": "range_trend_drop",
+                    "when": last["week_of"],
+                    "detail": (
+                        f"Projected full-charge rated range is down {abs(drop):.1f}%"
+                        f" from the first logged week ({first['projected_rated_range_mi']} mi"
+                        f" -> {last['projected_rated_range_mi']} mi). Early-life settling is"
+                        " normal; a sudden step usually follows a software update's"
+                        " recalibration rather than real capacity loss."
+                    ),
+                }
+            )
+
+    return {"days_scanned": days, "findings": findings}
+
+
+@mcp.tool()
+def battery_care_score(days: int = 90, car_id: int | None = None) -> dict:
+    """Battery-care habits over the last N days, scored out of 100 with the
+    evidence shown: DC fast-charge share of energy, charges to ~100%,
+    deep discharges below 10%, and the share of sampled parked time spent
+    sitting above 90% charge. A coaching summary no dashboard computes."""
+    car = resolve_car(car_id)
+    ch = q1(
+        """
+        SELECT
+          coalesce(sum(cp.charge_energy_added), 0) AS total_kwh,
+          coalesce(sum(cp.charge_energy_added) FILTER (
+            WHERE EXISTS (SELECT 1 FROM charges c
+                          WHERE c.charging_process_id = cp.id
+                            AND c.fast_charger_present)), 0) AS dc_kwh,
+          count(*) FILTER (WHERE cp.end_battery_level >= 98) AS full_charges,
+          count(*) AS sessions
+        FROM charging_processes cp
+        WHERE cp.car_id = %s AND cp.start_date >= now() - make_interval(days => %s)
+        """,
+        (car["id"], days),
+    )
+    deep = q1(
+        "SELECT count(*) AS n FROM drives d JOIN positions p ON p.id = d.end_position_id"
+        " WHERE d.car_id = %s AND d.start_date >= now() - make_interval(days => %s)"
+        " AND p.battery_level < 10",
+        (car["id"], days),
+    )
+    parked = q1(
+        "SELECT count(*) AS total,"
+        " count(*) FILTER (WHERE battery_level >= 90) AS high"
+        " FROM positions WHERE car_id = %s AND drive_id IS NULL"
+        " AND date >= now() - make_interval(days => %s)",
+        (car["id"], days),
+    )
+    total_kwh = float(ch["total_kwh"] or 0)
+    dc_share = round(float(ch["dc_kwh"] or 0) / total_kwh * 100.0, 1) if total_kwh else 0.0
+    parked_high_pct = (
+        round(parked["high"] / parked["total"] * 100.0, 1) if parked["total"] else None
+    )
+    score = 100
+    notes = []
+    if dc_share > 25:
+        score -= 15
+        notes.append(f"DC fast charging supplied {dc_share}% of energy (over a quarter).")
+    elif dc_share > 10:
+        score -= 7
+        notes.append(f"DC fast charging supplied {dc_share}% of energy.")
+    if ch["full_charges"]:
+        score -= min(ch["full_charges"] * 3, 15)
+        notes.append(f"{ch['full_charges']} charge(s) ended at 98-100%.")
+    if deep["n"]:
+        score -= min(deep["n"] * 4, 16)
+        notes.append(f"{deep['n']} drive(s) ended below 10% battery.")
+    if parked_high_pct is not None and parked_high_pct > 30:
+        score -= 12
+        notes.append(
+            f"The car sat above 90% charge for about {parked_high_pct}% of sampled parked time."
+        )
+    if not notes:
+        notes.append("No habit flags in this window: gentle charging profile.")
+    return {
+        "days": days,
+        "score_out_of_100": max(score, 0),
+        "dc_fast_charge_share_pct": dc_share,
+        "charges_to_full": ch["full_charges"],
+        "charge_sessions": ch["sessions"],
+        "deep_discharges_below_10pct": deep["n"],
+        "parked_time_above_90pct_share": parked_high_pct,
+        "notes": notes,
+    }
+
+
+@mcp.tool()
+def update_impact(car_id: int | None = None) -> dict:
+    """For each software update TeslaMate logged, compares the 14 days before
+    and after it: median efficiency and projected full-charge range. Shows
+    whether an update actually changed the car or just felt like it did."""
+    car = resolve_car(car_id)
+    updates = q(
+        "SELECT version, start_date FROM updates WHERE car_id = %s"
+        " AND start_date IS NOT NULL ORDER BY start_date",
+        (car["id"],),
+    )
+    out = []
+    for u in updates:
+        def window(sign):
+            op = "<" if sign < 0 else ">="
+            rng = "start_date - interval '14 days'" if sign < 0 else "start_date + interval '14 days'"
+            d = q1(
+                f"""
+                SELECT percentile_cont(0.5) WITHIN GROUP (
+                         ORDER BY (start_rated_range_km - end_rated_range_km)
+                                  / NULLIF(distance, 0)) AS rated_per_km
+                FROM drives
+                WHERE car_id = %s AND start_date {op} %s
+                  AND start_date {"<" if sign > 0 else ">="} ({rng.replace('start_date', '%s')})
+                  AND distance > 2
+                """,
+                (car["id"], u["start_date"], u["start_date"]),
+            )
+            return d["rated_per_km"] if d else None
+
+        before = window(-1)
+        after = window(1)
+        eff = float(car["efficiency"]) if car["efficiency"] else None
+
+        def to_whmi(rated_per_km):
+            if rated_per_km is None or not eff:
+                return None
+            return round(float(rated_per_km) * eff * 1000.0 / KM_TO_MI, 0)
+
+        out.append(
+            {
+                "version": u["version"],
+                "installed": u["start_date"].isoformat() if u["start_date"] else None,
+                "median_wh_per_mi_14d_before": to_whmi(before),
+                "median_wh_per_mi_14d_after": to_whmi(after),
+            }
+        )
+    return {"updates": out}
 
 
 class BearerAuthMiddleware:
